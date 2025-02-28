@@ -710,6 +710,67 @@ final class NIOAsyncWriterTests: XCTestCase {
 
         self.assert(suspendCallCount: 0, yieldCallCount: 0, terminateCallCount: 1)
     }
+
+    func testConcurrencyThreadPoolWidth() async {
+        let finished = expectation(description: "finished")
+        Thread {
+            var tasks: [(Task<Void, Never>, ConditionLock<Bool>)] = []
+            var initialNumberOfThreads = 0
+
+            // Start tasks and block them.
+            // Each task is given some time to start. If it takes too long, the thread pool has reached its maximum width.
+            for i in 0..<256 {
+                let taskStarted = ConditionLock(value: false)
+                let taskBlocker = ConditionLock(value: false)
+
+                print("\(Date.now): Starting Task \(i)")
+                fflush(stdout)
+                let startTime = ContinuousClock.now
+                let task = Task {
+                    print("\(Date.now): Task \(i) started")
+                    fflush(stdout)
+
+                    // Indicate that the task has started
+                    taskStarted.lock()
+                    taskStarted.unlock(withValue: true)
+
+                    // Block
+                    taskBlocker.lock(whenValue: true)
+                    taskBlocker.unlock()
+                }
+                tasks.append((task, taskBlocker))
+
+                if taskStarted.lock(whenValue: true, timeoutSeconds: 10) {
+                    taskStarted.unlock()
+                    if startTime.duration(to: .now) < .seconds(0.5) {
+                        // If the task started very quickly, a thread was already available.
+                        initialNumberOfThreads = i + 1
+                    }
+                } else {
+                    print("Detected initial number of threads: \(initialNumberOfThreads)")
+                    print("Detected maximum number of threads: \(i)")
+                    fflush(stdout)
+                    break
+                }
+            }
+
+            // Unblock all tasks
+            for (_, taskBlocker) in tasks {
+                taskBlocker.lock()
+                taskBlocker.unlock(withValue: true)
+            }
+
+            // Wait for all tasks to finish
+            Task {
+                for (task, _) in tasks {
+                    await task.value
+                }
+                finished.fulfill()
+            }
+        }.start()
+
+        await fulfillment(of: [finished], timeout: 600)
+    }
 }
 
 #if !canImport(Darwin) && swift(<5.9.2)
